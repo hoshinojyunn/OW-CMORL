@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""Four-environment conditioned 1M-slot HNSW scaling diagnostic.
-
-This script is a controlled scalability study, not a replacement for
-end-to-end OW-CMORL retraining.  Each environment uses its native
-dynamic-factor dimensionality and objective dimensionality to generate a
-distinct factor-conditioned embedding distribution.  The generated
-256-dimensional slot keys, query keys, and candidate solution profiles are
-then used to compare HNSW Top-K retrieval with exact Top-K retrieval under
-the same bank and the same query stream.
-"""
-
 from __future__ import annotations
 
 import argparse
