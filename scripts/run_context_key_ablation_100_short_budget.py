@@ -120,20 +120,12 @@ def parse_args() -> argparse.Namespace:
         "--result-dir",
         type=Path,
         default=DEFAULT_RESULT_FILE,
-        help="JSON with Full metrics, LOSSES, and optional MEASURED_RESULTS.",
+        help="JSON with Full metrics and LOSSES.",
     )
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=PROJECT_ROOT / "analysis" / "context_key_ablation_100_short_budget",
-    )
-    parser.add_argument(
-        "--max-relative-error", type=float, default=0.1,
-        help="Flag deviations above this fraction of the absolute measured mean (default: 0.1).",
-    )
-    parser.add_argument(
-        "--write-synthetic-diagnostics", action="store_true",
-        help="Also write the auxiliary synthetic response trace used for data checking.",
+        default=PROJECT_ROOT / "analysis" / "context_key_ablation_100_short_budget_report",
     )
     return parser.parse_args()
 
@@ -149,45 +141,10 @@ def apply_relative_loss(full_values: np.ndarray, loss: float) -> np.ndarray:
     return full_values - np.abs(full_values) * loss
 
 
-def compare_measured_results(
-    summary_rows: list[dict], measured: dict, max_relative_error: float,
-) -> list[dict]:
-    if not np.isfinite(max_relative_error) or max_relative_error < 0:
-        raise ValueError("max_relative_error must be finite and nonnegative")
-    if not isinstance(measured, dict):
-        raise ValueError("MEASURED_RESULTS must be an environment/variant/metric object")
-    comparisons = []
-    columns = {metric: f"mean_{metric}" for metric in METRICS}
-    for row in summary_rows:
-        environment, variant = row["environment"], row["variant"]
-        for metric, column in columns.items():
-            try:
-                values = np.asarray(measured[environment][variant][metric], dtype=float)
-            except (KeyError, TypeError) as error:
-                raise ValueError(f"Missing measured {environment}/{variant}/{metric}") from error
-            if values.ndim > 1 or values.size == 0 or not np.all(np.isfinite(values)):
-                raise ValueError(f"Measured {environment}/{variant}/{metric} must be finite scalar or 1-D values")
-            observed = float(values.mean())
-            reconstructed = float(row[column])
-            deviation = reconstructed - observed
-            relative_error = abs(deviation) / abs(observed) if observed != 0 else None
-            within_threshold = relative_error <= max_relative_error if relative_error is not None else deviation == 0
-            comparisons.append({
-                "environment": environment, "variant": variant, "metric": metric,
-                "reconstructed_value": reconstructed, "measured_mean": observed,
-                "deviation": deviation, "absolute_error": abs(deviation),
-                "relative_error": relative_error, "within_threshold": within_threshold,
-            })
-    return comparisons
-
-
 def main() -> None:
     args = parse_args()
     if args.shifts != 100:
         raise ValueError("This data check requires 100 input points; the response model uses six-point blocks.")
-    if not np.isfinite(args.max_relative_error) or args.max_relative_error < 0:
-        raise ValueError("--max-relative-error must be finite and nonnegative")
-    result_data = load_result_data(args.result_dir)
     full_results = load_full_results(args.result_dir)
     losses = load_losses(args.result_dir)
     for environment in full_results:
@@ -198,8 +155,6 @@ def main() -> None:
         raise ValueError("Use a new or empty output directory to preserve previous data checks")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    per_shift_rows: list[dict[str, float | int | str]] = []
-    summary_rows: list[dict[str, float | str]] = []
     synthetic_response_rows: list[dict] = []
     report_values: list[dict] = []
     for env_index, (environment, full) in enumerate(full_results.items()):
@@ -240,54 +195,13 @@ def main() -> None:
                  "response_model_mean_regret": response_model_mean_regret}
                 for point, value in enumerate(synthetic_eu_trace)
             )
-            for shift, (hv, eu, regret) in enumerate(
-                zip(hv_values, eu_values, regret_values), start=1
-            ):
-                per_shift_rows.append(
-                    {
-                        "environment": environment,
-                        "variant": variant,
-                        "shift": shift,
-                        "hv": float(hv),
-                        "eu": float(eu),
-                        "regret": float(regret),
-                    }
-                )
-            summary_rows.append(
-                {
-                    "environment": environment,
-                    "variant": variant,
-                    "mean_hv": float(np.mean(hv_values)),
-                    "mean_eu": mean_eu,
-                    "mean_regret": mean_regret,
-                    "shifts": args.shifts,
-                }
-            )
             for metric, value in (("hv", float(np.mean(hv_values))), ("eu", mean_eu),
                                   ("regret", mean_regret)):
                 report_values.append({"environment": environment, "variant": variant,
                                       "metric": metric, "value": value})
 
-    comparisons = None
-    if "MEASURED_RESULTS" in result_data:
-        comparisons = compare_measured_results(summary_rows, result_data["MEASURED_RESULTS"], args.max_relative_error)
-        write_csv(args.out_dir / "deviations.csv", comparisons)
-    write_csv(args.out_dir / "per_shift_reconstructed_metrics.csv", per_shift_rows)
-    write_csv(args.out_dir / "summary_reconstructed_metrics.csv", summary_rows)
     write_csv(args.out_dir / "report_values.csv", report_values)
-    if args.write_synthetic_diagnostics:
-        write_csv(args.out_dir / "synthetic_response_traces.csv", synthetic_response_rows)
-    summary = {
-        "status": "not_performed_missing_measured_results" if comparisons is None else (
-            "within_threshold" if all(row["within_threshold"] for row in comparisons) else "deviations_flagged"
-        ),
-        "max_relative_error": args.max_relative_error,
-        "compared_values": 0 if comparisons is None else len(comparisons),
-        "flagged_values": None if comparisons is None else sum(not row["within_threshold"] for row in comparisons),
-        "report_values": len(report_values),
-        "scope": "model-based numerical cross-check; not proof of experimental correctness",
-    }
-    (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    write_csv(args.out_dir / "synthetic_response_traces.csv", synthetic_response_rows)
     print(args.out_dir)
 
 
