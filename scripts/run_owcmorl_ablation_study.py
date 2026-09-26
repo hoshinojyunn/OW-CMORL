@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""Reproducible replay or fresh-rollout ablations for OW-CMORL.
-
-The default mode uses saved scalarized-policy snapshots and their
-per-regime rollouts.  That replay/re-inference mode is not a replacement for
-the 20-regime end-to-end table in the paper.  This keeps the ablations small
-enough to run on CPU while preserving real policy returns and dynamic traces.
-Use --execution-mode rollout to train native OW-CMORL variants and collect
-new environment trajectories instead of replaying archived returns.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -285,10 +274,6 @@ def context_vectors(
     *,
     snapshot_root: Path,
 ) -> dict[str, np.ndarray]:
-    # Fine-regime runs persist the exact dynamic-factor vector with every
-    # regime return. Prefer those values whenever they are available so all
-    # four environments use the operating conditions that produced the saved
-    # policy evaluations.
     persisted_catalog: dict[str, np.ndarray] = {}
     factor_catalog: dict[str, dict[str, float]] = {}
     factor_keys: set[str] = set()
@@ -339,7 +324,6 @@ def context_vectors(
             for regime, value in zip(regimes, values)
         }
     if env_key == "evcharging":
-        # The period is the exogenous dynamic factor available to the wrapper.
         return {
             regime: np.eye(len(regimes), dtype=np.float32)[idx]
             for idx, regime in enumerate(regimes)
@@ -371,7 +355,6 @@ def _build_target_embeddings(
     current_residual_lambda: float = 0.0,
     current_tokens: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Match OnlineContextMemory's target-key construction for one trace pass."""
     memory = OnlineContextMemory(
         max_size=max(1, len(regimes)),
         history_lambda=history_lambda,
@@ -457,12 +440,6 @@ def build_context_representations(
             forecast=np.stack([forecast_embeddings[regime] for regime in regimes]),
         )
 
-    # The default values are the actual OW-CMORL defaults.  All H2 variants
-    # retain the same fitted encoder and bank; only one target-key term is
-    # disabled at a time.
-    # Measure the query-key path separately from retrieval. This makes it
-    # explicit that H1 removes compute but is evaluated for decision quality
-    # and recovery rather than being falsely presented as a slower encoder.
     timing_repeats = 64
     start = time.perf_counter()
     for _ in range(timing_repeats):
@@ -503,8 +480,6 @@ def build_context_representations(
             current_residual_lambda=current_residual_lambda,
             current_tokens=current_embeddings,
         ),
-        # H1 disables the Transformer and uses only the current observed
-        # environment token as both the bank anchor and the query.
         current_token={regime: _normalize_vector(vector) for regime, vector in vectors.items()},
         encoder_ms_per_query=float(encoder_ms_per_query),
         current_token_ms_per_query=float(current_token_ms_per_query),
@@ -572,9 +547,6 @@ def route_variant(
     selected_segments: dict[str, np.ndarray] = {}
     selected_ids: dict[str, list[str]] = {}
     for regime in regimes:
-        # Fine-regime snapshots are saved only under conditions where they
-        # were actually evaluated. Filter before routing so a selected policy
-        # is never credited with a fabricated return for another condition.
         available_entries = [entry for entry in entries if regime in entry.policy.returns]
         if not available_entries:
             raise ValueError(f"no saved policy return for {regime!r}")
@@ -589,9 +561,6 @@ def route_variant(
             available_entries[int(index)]
             for index in retriever.query(embeddings[regime], candidate_count)
         ]
-        # Both backends use the same final candidate budget and the same
-        # context-slot score. HNSW differs only in approximate neighbor
-        # recall; exact search scores the complete bank before this step.
         candidates = sorted(candidates, key=lambda item: (-item.score, item.policy.policy_id))[:retrieval_k]
         unique: dict[str, BankEntry] = {}
         for candidate in candidates:
@@ -675,7 +644,6 @@ def add_relative_metrics(variants: dict[str, dict]) -> None:
 
 
 def composite_trace(regimes: list[str], segments: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    # Repeat the observed regime order so every transition contributes a real stored rollout segment.
     schedule = regimes * 4
     rows = []
     ids = []
