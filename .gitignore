@@ -5,10 +5,13 @@ environments/
 !README.md
 !src/
 !scripts/
+!tests/
 !src/**/
 !scripts/**/
+!tests/**/
 !src/**/*.py
 !scripts/**/*.py
+!tests/**/*.py
 !morl/
 !MORL-CA/
 !PGMORL/

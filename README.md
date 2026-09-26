@@ -78,6 +78,16 @@ python scripts/reevaluate_dynamic_run_shared_protocol.py \
 
 Use a new target directory for each re-evaluation. The target contains `regime_fronts/shared_final.json`, per-regime exports, and a summary under `final/`. To reproduce comparisons, use the same shared plan and seed offset for every method.
 
+## Tests
+
+Run the repository tests from the root directory with:
+
+```bash
+python -m pytest -q tests
+```
+
+The memory-ablation and HV rescoring tests are skipped when the optional `pymoo` dependency is not installed.
+
 ## Publication scope
 
 This repository tracks Python source, this README, and `.gitignore` only. Datasets, checkpoints, logs, figures, tables, reports, and other generated artifacts remain local.
