@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Small, reproducible ablations for OW-CMORL retrieval components.
+"""Reproducible replay or fresh-rollout ablations for OW-CMORL.
 
-The script deliberately uses the saved scalarized-policy snapshots and their
-per-regime rollouts.  It is a replay/re-inference study, not a replacement for
+The default mode uses saved scalarized-policy snapshots and their
+per-regime rollouts.  That replay/re-inference mode is not a replacement for
 the 20-regime end-to-end table in the paper.  This keeps the ablations small
 enough to run on CPU while preserving real policy returns and dynamic traces.
+Use --execution-mode rollout to train native OW-CMORL variants and collect
+new environment trajectories instead of replaying archived returns.
 """
 
 from __future__ import annotations
@@ -12,11 +14,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import time
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Iterable
+
+for thread_variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(thread_variable, "1")
 
 import hnswlib
 import numpy as np
@@ -84,11 +90,20 @@ class HNSWRetriever:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execution-mode", choices=("replay", "rollout"), default="replay")
+    parser.add_argument("--train-timesteps", type=int, default=2048)
+    parser.add_argument("--init-timesteps", type=int, default=512)
+    parser.add_argument("--rollout-steps", type=int, default=16)
+    parser.add_argument("--eval-episodes", type=int, default=100)
+    parser.add_argument("--evaluation-workers", type=int, default=3)
+    parser.add_argument("--rollout-plan-dir", type=Path, default=PROJECT_ROOT / "analysis/lcpo_lightweight_100")
+    parser.add_argument("--only-variants", nargs="+", choices=("full_hnsw", "h1_current_token_no_encoder", "h2_no_forecast", "h2_no_history"))
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--env-keys", nargs="+", default=["building", "evcharging", "cogen"])
     parser.add_argument(
         "--snapshot-root",
         type=Path,
-        default=PROJECT_ROOT / "results_fine_regime" / "scalarized_baselines",
+        default=PROJECT_ROOT / "archives_npz_canonical_shared_protocol",
     )
     parser.add_argument(
         "--out-dir",
@@ -98,7 +113,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--context-window", type=int, default=3)
     parser.add_argument("--context-fit-steps", type=int, default=32)
+    parser.add_argument("--context-encoder-update-mode", choices=("refit", "frozen"), default="refit")
+    parser.add_argument("--forecast-lambda", type=float, default=0.50)
+    parser.add_argument("--history-lambda", type=float, default=0.10)
+    parser.add_argument(
+        "--current-residual-lambda",
+        type=float,
+        default=0.0,
+        help="blend a normalized current-context token into encoder-derived Full/H2 keys",
+    )
     parser.add_argument("--retrieval-k", type=int, default=8)
+    parser.add_argument(
+        "--full-retrieval-mode",
+        choices=("hnsw", "exact"),
+        default="hnsw",
+        help="retrieval backend used by the Full-window variant",
+    )
+    parser.add_argument(
+        "--full-retrieval-k",
+        type=int,
+        default=None,
+        help="candidate budget used by Full; defaults to --retrieval-k",
+    )
+    parser.add_argument(
+        "--ablation-retrieval-mode",
+        choices=("hnsw", "exact"),
+        default="hnsw",
+        help="shared retrieval backend for H1/H2 variants",
+    )
+    parser.add_argument(
+        "--ablation-retrieval-k",
+        type=int,
+        default=None,
+        help="shared candidate budget for H1/H2 variants; defaults to --retrieval-k",
+    )
+    parser.add_argument(
+        "--context-affinity-weight",
+        type=float,
+        default=0.30,
+        help="weight of context affinity in final retrieved-policy selection",
+    )
     parser.add_argument("--hnsw-ef-search", type=int, default=32)
     parser.add_argument("--hnsw-m", type=int, default=16)
     parser.add_argument(
@@ -109,6 +163,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--latency-replicas", type=int, default=16)
     parser.add_argument("--latency-query-repeats", type=int, default=1500)
+    parser.add_argument("--skip-latency", action="store_true")
     return parser.parse_args()
 
 
@@ -137,6 +192,53 @@ def _load_segments(path: Path) -> dict[str, np.ndarray]:
                 np.asarray([float(row[key]) for key in obj_cols], dtype=np.float64)
             )
     return {regime: np.stack(values, axis=0) for regime, values in grouped.items() if values}
+
+
+def _load_npz_snapshots(snapshot_root: Path, env_key: str) -> list[PolicySnapshot]:
+    grouped: dict[tuple[str, str], dict] = {}
+    for archive_path in sorted((snapshot_root / env_key).rglob("*.npz")):
+        archive = np.load(archive_path, allow_pickle=True)
+        try:
+            raw = json.loads(str(archive["meta_json"].item()))
+            if raw.get("source_type") != "scalarized_result":
+                continue
+            regime = str(raw["regime"])
+            key = "pareto_front" if "pareto_front" in archive.files else "solutions"
+            points = np.asarray(archive[key], dtype=np.float64)
+        finally:
+            archive.close()
+        if points.ndim == 1:
+            points = points[None, :]
+        if points.ndim != 2 or len(points) == 0:
+            continue
+        algorithm = str(raw.get("method", "archive"))
+        source_paths = [str(item) for item in raw.get("source_paths", []) if item]
+        run_tags = [str(item) for item in raw.get("run_tags", []) if item]
+        group_keys = set()
+        for source_path in source_paths:
+            source = Path(source_path)
+            group_keys.add((algorithm, source.parent.name))
+        if not group_keys:
+            group_keys = {(algorithm, run_tags[0] if run_tags else archive_path.stem)}
+        for group_key in group_keys:
+            row = grouped.setdefault(
+                group_key,
+                {"returns": {}, "segments": {}, "raw": {"trace_metrics": {}}},
+            )
+            row["returns"].setdefault(regime, np.mean(points, axis=0))
+            row["segments"].setdefault(regime, points)
+    records = [
+        (
+            f"{algorithm}/{run_tag}",
+            algorithm,
+            row["returns"],
+            row["segments"],
+            row["raw"],
+        )
+        for (algorithm, run_tag), row in grouped.items()
+        if row["returns"]
+    ]
+    return _rank_quality(records) if records else []
 
 
 def _rank_quality(records: list[tuple[str, str, dict[str, np.ndarray], dict[str, np.ndarray], dict]]) -> list[PolicySnapshot]:
@@ -169,7 +271,11 @@ def load_snapshots(snapshot_root: Path, env_key: str) -> list[PolicySnapshot]:
         policy_id = f"{raw['alg']}/{result_path.parent.name}"
         records.append((policy_id, str(raw["alg"]), returns, _load_segments(result_path.parent / "dynamic_trace.csv"), raw))
     if not records:
-        raise FileNotFoundError(f"no result.json snapshots found for {env_key}: {snapshot_root / env_key}")
+        records = []
+        snapshots = _load_npz_snapshots(snapshot_root, env_key)
+        if snapshots:
+            return snapshots
+        raise FileNotFoundError(f"no snapshots found for {env_key}: {snapshot_root / env_key}")
     return _rank_quality(records)
 
 
@@ -184,6 +290,8 @@ def context_vectors(
     # four environments use the operating conditions that produced the saved
     # policy evaluations.
     persisted_catalog: dict[str, np.ndarray] = {}
+    factor_catalog: dict[str, dict[str, float]] = {}
+    factor_keys: set[str] = set()
     for result_path in sorted((snapshot_root / env_key).glob("*/*/result.json")):
         payload = json.loads(result_path.read_text())
         persisted = {
@@ -193,6 +301,25 @@ def context_vectors(
         }
         for regime, vector in persisted.items():
             persisted_catalog.setdefault(regime, vector)
+    if not all(regime in persisted_catalog for regime in regimes):
+        for archive_path in sorted((snapshot_root / env_key).rglob("*.npz")):
+            archive = np.load(archive_path, allow_pickle=True)
+            try:
+                raw = json.loads(str(archive["meta_json"].item()))
+            finally:
+                archive.close()
+            regime = str(raw.get("regime", ""))
+            factors = raw.get("dynamic_factors") or raw.get("regime_meta")
+            if regime in regimes and factors:
+                normalized = {str(key): float(value) for key, value in factors.items()}
+                factor_catalog.setdefault(regime, normalized)
+                factor_keys.update(normalized)
+        if factor_catalog:
+            ordered_keys = sorted(factor_keys)
+            for regime, factors in factor_catalog.items():
+                persisted_catalog[regime] = np.asarray(
+                    [factors.get(key, 0.0) for key in ordered_keys], dtype=np.float32
+                )
     if all(regime in persisted_catalog for regime in regimes):
         return {regime: persisted_catalog[regime] for regime in regimes}
 
@@ -241,6 +368,8 @@ def _build_target_embeddings(
     *,
     forecast_lambda: float,
     history_lambda: float,
+    current_residual_lambda: float = 0.0,
+    current_tokens: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Match OnlineContextMemory's target-key construction for one trace pass."""
     memory = OnlineContextMemory(
@@ -254,6 +383,10 @@ def _build_target_embeddings(
         current_embedding = np.asarray(current[regime], dtype=np.float64)
         forecast_embedding = np.asarray(forecast[regime], dtype=np.float64)
         target = memory.build_target_embedding(current_embedding, forecast_embedding)
+        if current_tokens is not None and current_residual_lambda > 0.0:
+            residual = _normalize_vector(current_tokens[regime])
+            blend = float(np.clip(current_residual_lambda, 0.0, 1.0))
+            target = (1.0 - blend) * target + blend * residual
         targets[regime] = _normalize_vector(target)
         memory.update(
             ContextSnapshot(
@@ -277,6 +410,10 @@ def build_context_representations(
     snapshot_root: Path,
     window: int,
     fit_steps: int,
+    forecast_lambda: float,
+    history_lambda: float,
+    current_residual_lambda: float,
+    checkpoint_dir: Path | None,
     seed: int,
 ) -> ContextRepresentations:
     torch.manual_seed(seed)
@@ -296,6 +433,29 @@ def build_context_representations(
         current, forecast, _prediction = model.encode_with_forecast(trace, device=torch.device("cpu"))
         current_embeddings[regime] = np.asarray(current, dtype=np.float64)
         forecast_embeddings[regime] = np.asarray(forecast, dtype=np.float64)
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "env_key": env_key,
+                "seed": int(seed),
+                "window": int(window),
+                "fit_steps": int(fit_steps),
+                "forecast_lambda": float(forecast_lambda),
+                "history_lambda": float(history_lambda),
+                "current_residual_lambda": float(current_residual_lambda),
+                "regimes": list(regimes),
+                "model_state_dict": model.state_dict(),
+            },
+            checkpoint_dir / f"{env_key}_context_encoder.pt",
+        )
+        np.savez_compressed(
+            checkpoint_dir / f"{env_key}_context_keys.npz",
+            regimes=np.asarray(regimes),
+            current=np.stack([current_embeddings[regime] for regime in regimes]),
+            forecast=np.stack([forecast_embeddings[regime] for regime in regimes]),
+        )
 
     # The default values are the actual OW-CMORL defaults.  All H2 variants
     # retain the same fitted encoder and bank; only one target-key term is
@@ -320,22 +480,28 @@ def build_context_representations(
             regimes,
             current_embeddings,
             forecast_embeddings,
-            forecast_lambda=0.50,
-            history_lambda=0.10,
+            forecast_lambda=forecast_lambda,
+            history_lambda=history_lambda,
+            current_residual_lambda=current_residual_lambda,
+            current_tokens=current_embeddings,
         ),
         no_forecast=_build_target_embeddings(
             regimes,
             current_embeddings,
             forecast_embeddings,
             forecast_lambda=0.0,
-            history_lambda=0.10,
+            history_lambda=history_lambda,
+            current_residual_lambda=current_residual_lambda,
+            current_tokens=current_embeddings,
         ),
         no_history=_build_target_embeddings(
             regimes,
             current_embeddings,
             forecast_embeddings,
-            forecast_lambda=0.50,
+            forecast_lambda=forecast_lambda,
             history_lambda=0.0,
+            current_residual_lambda=current_residual_lambda,
+            current_tokens=current_embeddings,
         ),
         # H1 disables the Transformer and uses only the current observed
         # environment token as both the bank anchor and the query.
@@ -395,6 +561,7 @@ def route_variant(
     retrieval_k: int,
     hnsw_ef_search: int,
     hnsw_m: int,
+    context_affinity_weight: float = 0.30,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, list[str]]]:
     all_returns = np.concatenate(
         [np.stack([entry.policy.returns[regime] for entry in entries if regime in entry.policy.returns]) for regime in regimes], axis=0
@@ -437,7 +604,7 @@ def route_variant(
             key=lambda item: (
                 utility(item.policy.returns[regime], lower, span)
                 + 0.20 * item.score
-                + 0.30 * cosine_affinity(item.embedding, embeddings[regime])
+                + context_affinity_weight * cosine_affinity(item.embedding, embeddings[regime])
             ),
         )
         selected_segments[regime] = best.policy.segments.get(regime, best.policy.returns[regime][None, :])
@@ -487,27 +654,22 @@ def score_variants(variant_fronts: dict[str, dict[str, np.ndarray]]) -> dict[str
     return output
 
 
-def relative_change_pct(value: float, baseline: float) -> float | None:
+def relative_drop_ratio(value: float, baseline: float) -> float | None:
     baseline = float(baseline)
     if abs(baseline) < 1e-12:
         return None
-    return float(100.0 * (float(value) - baseline) / abs(baseline))
+    return float((baseline - float(value)) / abs(baseline))
 
 
 def add_relative_metrics(variants: dict[str, dict]) -> None:
     baseline = variants["full_hnsw"]
-    baseline_trace = baseline["trace"]
     for row in variants.values():
-        trace = row["trace"]
         row["relative_to_full"] = {
-            "mean_regime_hv_pct": relative_change_pct(
+            "hv_drop_ratio": relative_drop_ratio(
                 row["mean_regime_hv"], baseline["mean_regime_hv"]
             ),
-            "mean_regime_eu_pct": relative_change_pct(
+            "eu_drop_ratio": relative_drop_ratio(
                 row["mean_regime_eu"], baseline["mean_regime_eu"]
-            ),
-            "trace_shift_regret_pct": relative_change_pct(
-                trace["trace_shift_regret"], baseline_trace["trace_shift_regret"]
             ),
         }
 
@@ -566,10 +728,13 @@ def benchmark_latency(
 
 def persisted_variant_metrics(summary: dict) -> dict:
     return {
+        "mean_regime_hv": summary["mean_regime_hv"],
+        "mean_regime_eu": summary["mean_regime_eu"],
         "relative_to_full": summary["relative_to_full"],
         "adapt_score": summary["adapt_score"],
         "trace": {
             "trace_shift_count": summary["trace"]["trace_shift_count"],
+            "trace_shift_regret": summary["trace"]["trace_shift_regret"],
             "trace_recovery_latency": summary["trace"]["trace_recovery_latency"],
             "trace_recovery_score": summary["trace"]["trace_recovery_score"],
         },
@@ -616,7 +781,7 @@ def write_report(path: Path, results: dict) -> None:
         "",
         "`delta` is relative to Full HNSW in the same environment, computed as `100 * (variant - Full) / abs(Full)`; a zero Full value is reported as `n/a`. Higher HV, EU, and adaptation score are better; lower shift regret and recovery latency (episodes) are better.",
         "",
-        "Only relative HV/EU/shift-regret differences are retained; their absolute values are computed in memory and are not written to the report or JSON output.",
+        "Absolute mean HV/EU and shift-regret values are retained alongside relative differences so that the context-window table can be regenerated directly from this run.",
         "",
         "| Environment | Variant | HV delta | EU delta | adapt. | shift-regret delta | recovery episodes |",
         "|---|---|---:|---:|---:|---:|---:|",
@@ -662,19 +827,17 @@ def write_report(path: Path, results: dict) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.execution_mode == "rollout":
+        from run_context_ablation_rollouts import run_rollout_study
+
+        run_rollout_study(args)
+        return
     np.random.seed(args.seed)
     torch.set_num_threads(1)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     results = {
-        "config": vars(args),
-        "metric_comparison": {
-            "baseline_variant": "full_hnsw",
-            "relative_difference_formula": "100 * (variant - full_hnsw) / abs(full_hnsw)",
-            "absolute_hv_eu_shift_regret_persisted": False,
-        },
         "environments": {},
     }
-    results["config"] = {key: str(value) if isinstance(value, Path) else value for key, value in results["config"].items()}
     for env_key in args.env_keys:
         snapshots = load_snapshots(args.snapshot_root, env_key)
         regimes = sorted({regime for snapshot in snapshots for regime in snapshot.returns})
@@ -684,10 +847,16 @@ def main() -> None:
             snapshot_root=args.snapshot_root,
             window=args.context_window,
             fit_steps=args.context_fit_steps,
+            forecast_lambda=args.forecast_lambda,
+            history_lambda=args.history_lambda,
+            current_residual_lambda=args.current_residual_lambda,
+            checkpoint_dir=None,
             seed=args.seed,
         )
         full_entries = build_entries(snapshots, representations.full)
         current_token_entries = build_entries(snapshots, representations.current_token)
+        ablation_mode = args.ablation_retrieval_mode
+        ablation_k = args.ablation_retrieval_k or args.retrieval_k
         single_algorithm = str(args.single_algorithm)
         if not [snapshot for snapshot in snapshots if snapshot.algorithm == single_algorithm]:
             raise ValueError(f"no {single_algorithm!r} snapshots available for {env_key}")
@@ -695,81 +864,60 @@ def main() -> None:
         trace_segments = {}
         selections = {}
         variants = {
-            "full_hnsw": (full_entries, representations.full, "hnsw"),
+            "full_hnsw": (
+                full_entries,
+                representations.full,
+                args.full_retrieval_mode,
+                args.full_retrieval_k or args.retrieval_k,
+            ),
             "h1_current_token_no_encoder": (
                 current_token_entries,
                 representations.current_token,
-                "hnsw",
+                ablation_mode,
+                ablation_k,
             ),
-            "h2_no_forecast": (full_entries, representations.no_forecast, "hnsw"),
-            "h2_no_history": (full_entries, representations.no_history, "hnsw"),
-            "full_exact": (full_entries, representations.full, "exact"),
+            "h2_no_forecast": (full_entries, representations.no_forecast, ablation_mode, ablation_k),
+            "h2_no_history": (full_entries, representations.no_history, ablation_mode, ablation_k),
+            "full_exact": (full_entries, representations.full, "exact", args.retrieval_k),
         }
-        for name, (entries, query_embeddings, mode) in variants.items():
+        if args.only_variants:
+            selected_variants = set(args.only_variants)
+            if "full_hnsw" not in selected_variants:
+                raise ValueError("--only-variants must include full_hnsw as the comparison baseline")
+            variants = {name: spec for name, spec in variants.items() if name in selected_variants}
+        else:
+            variants = {name: spec for name, spec in variants.items() if name != "full_exact"}
+        for name, (entries, query_embeddings, mode, retrieval_k) in variants.items():
             fronts, segments, ids = route_variant(
                 entries,
                 query_embeddings,
                 regimes,
                 mode=mode,
-                retrieval_k=args.retrieval_k,
+                retrieval_k=retrieval_k,
                 hnsw_ef_search=args.hnsw_ef_search,
                 hnsw_m=args.hnsw_m,
+                context_affinity_weight=args.context_affinity_weight,
             )
             front_rows[name] = fronts
             trace_segments[name] = segments
             selections[name] = ids
         summaries = score_variants(front_rows)
-        for name, summary in summaries.items():
-            summary["trace"] = compute_trace_shift_metrics(
-                composite_trace(regimes, trace_segments[name]), eval_delta_weight=0.5
-            )
         add_relative_metrics(summaries)
-        full_latency = benchmark_latency(
-            full_entries,
-            representations.full,
-            replicas=args.latency_replicas,
-            repeats=args.latency_query_repeats,
-            retrieval_k=args.retrieval_k,
-            ef_search=args.hnsw_ef_search,
-            m=args.hnsw_m,
-            seed=args.seed,
-        )
-        current_token_latency = benchmark_latency(
-            current_token_entries,
-            representations.current_token,
-            replicas=args.latency_replicas,
-            repeats=args.latency_query_repeats,
-            retrieval_k=args.retrieval_k,
-            ef_search=args.hnsw_ef_search,
-            m=args.hnsw_m,
-            seed=args.seed,
-        )["hnsw"]
         results["environments"][env_key] = {
-            "snapshot_count": len(snapshots),
-            "bank_entry_count": len(full_entries),
-            "single_algorithm": single_algorithm,
-            "current_token_bank_entry_count": len(current_token_entries),
             "variants": {
-                name: persisted_variant_metrics(summary)
+                name: (
+                    {
+                        "hv": summary["mean_regime_hv"],
+                        "eu": summary["mean_regime_eu"],
+                    }
+                    if name == "full_hnsw"
+                    else summary["relative_to_full"]
+                )
                 for name, summary in summaries.items()
             },
-            "latency": {
-                "full_hnsw": full_latency["hnsw"],
-                "full_exact": full_latency["exact"],
-                "h1_current_token_no_encoder": current_token_latency,
-            },
-            "representation_latency_ms": {
-                "full_encoder": representations.encoder_ms_per_query,
-                "current_token": representations.current_token_ms_per_query,
-            },
-            "selected_policy_ids": selections,
         }
         print(json.dumps({env_key: results["environments"][env_key]}, indent=2))
-    (args.out_dir / "ablation_metrics.json").write_text(json.dumps(results, indent=2))
-    (args.out_dir / "latency_benchmark.json").write_text(
-        json.dumps({key: value["latency"] for key, value in results["environments"].items()}, indent=2)
-    )
-    write_report(PROJECT_ROOT / "OW_CMORL_H1_H2_HNSW_ABLATION_ZH.md", results)
+    (args.out_dir / "context_representation_hv_eu.json").write_text(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":
