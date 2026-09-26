@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""Run a small, real shared-protocol study for condition-level paired tests.
-
-This runner evaluates a fixed, evenly-spaced subset of ten conditions from the
-registered 100-condition plans.  The ten aligned conditions are the sample
-units in the companion scorer; they are not ten independent training seeds.
-"""
-
 from __future__ import annotations
 
 import argparse
