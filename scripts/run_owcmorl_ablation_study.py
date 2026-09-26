@@ -487,6 +487,31 @@ def score_variants(variant_fronts: dict[str, dict[str, np.ndarray]]) -> dict[str
     return output
 
 
+def relative_change_pct(value: float, baseline: float) -> float | None:
+    baseline = float(baseline)
+    if abs(baseline) < 1e-12:
+        return None
+    return float(100.0 * (float(value) - baseline) / abs(baseline))
+
+
+def add_relative_metrics(variants: dict[str, dict]) -> None:
+    baseline = variants["full_hnsw"]
+    baseline_trace = baseline["trace"]
+    for row in variants.values():
+        trace = row["trace"]
+        row["relative_to_full"] = {
+            "mean_regime_hv_pct": relative_change_pct(
+                row["mean_regime_hv"], baseline["mean_regime_hv"]
+            ),
+            "mean_regime_eu_pct": relative_change_pct(
+                row["mean_regime_eu"], baseline["mean_regime_eu"]
+            ),
+            "trace_shift_regret_pct": relative_change_pct(
+                trace["trace_shift_regret"], baseline_trace["trace_shift_regret"]
+            ),
+        }
+
+
 def composite_trace(regimes: list[str], segments: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     # Repeat the observed regime order so every transition contributes a real stored rollout segment.
     schedule = regimes * 4
@@ -539,13 +564,15 @@ def benchmark_latency(
     return results
 
 
-def table1_owcmorl_baseline() -> dict[str, dict[str, float]]:
-    # Copied from innovation_paper/iclr2026_conference.tex, Table 1.
+def persisted_variant_metrics(summary: dict) -> dict:
     return {
-        "building": {"hv": 1.4032e10, "eu": 8880.1323, "adapt": 0.7515, "regret": 3.1113, "latency": 5.7895},
-        "evcharging": {"hv": 0.0720, "eu": 1.1956, "adapt": 0.9544, "regret": 0.4614, "latency": 0.8279},
-        "cogen": {"hv": 5.1418e23, "eu": -2.4208e6, "adapt": 0.5710, "regret": 7999.5839, "latency": 5.5714},
-        "chlor_alkali": {"hv": 1.0261e12, "eu": -8.1809e4, "adapt": 0.9823, "regret": 96.1114, "latency": 6.5718},
+        "relative_to_full": summary["relative_to_full"],
+        "adapt_score": summary["adapt_score"],
+        "trace": {
+            "trace_shift_count": summary["trace"]["trace_shift_count"],
+            "trace_recovery_latency": summary["trace"]["trace_recovery_latency"],
+            "trace_recovery_score": summary["trace"]["trace_recovery_score"],
+        },
     }
 
 
@@ -558,10 +585,10 @@ def write_report(path: Path, results: dict) -> None:
         "full_exact": "HNSW ablation: exact retrieval",
     }
 
-    def pct(value: float, baseline: float) -> str:
-        if abs(float(baseline)) < 1e-12:
+    def pct(value: float | None) -> str:
+        if value is None:
             return "n/a"
-        return f"{100.0 * (float(value) - float(baseline)) / abs(float(baseline)):+.1f}%"
+        return f"{float(value):+.1f}%"
 
     def routing_ms(env_result: dict, variant: str) -> float:
         latency = env_result["latency"]
@@ -587,19 +614,20 @@ def write_report(path: Path, results: dict) -> None:
         "",
         "## Solution-set and dynamic metrics",
         "",
-        "`delta` is relative to Full HNSW in the same environment. Higher HV, EU, and adaptation score are better; lower shift regret and recovery latency (episodes) are better.",
+        "`delta` is relative to Full HNSW in the same environment, computed as `100 * (variant - Full) / abs(Full)`; a zero Full value is reported as `n/a`. Higher HV, EU, and adaptation score are better; lower shift regret and recovery latency (episodes) are better.",
         "",
-        "| Environment | Variant | HV | delta | EU | delta | adapt. | regret | delta | recovery episodes |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "Only relative HV/EU/shift-regret differences are retained; their absolute values are computed in memory and are not written to the report or JSON output.",
+        "",
+        "| Environment | Variant | HV delta | EU delta | adapt. | shift-regret delta | recovery episodes |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for env_key, env_result in results["environments"].items():
         for key in labels:
             row = env_result["variants"][key]
             trace = row["trace"]
-            base = env_result["variants"]["full_hnsw"]
-            base_trace = base["trace"]
+            delta = row["relative_to_full"]
             lines.append(
-                f"| {env_key} | {labels[key]} | {row['mean_regime_hv']:.4g} | {pct(row['mean_regime_hv'], base['mean_regime_hv'])} | {row['mean_regime_eu']:.4g} | {pct(row['mean_regime_eu'], base['mean_regime_eu'])} | {row['adapt_score']:.3f} | {trace['trace_shift_regret']:.4g} | {pct(trace['trace_shift_regret'], base_trace['trace_shift_regret'])} | {trace['trace_recovery_latency']:.3g} |"
+                f"| {env_key} | {labels[key]} | {pct(delta['mean_regime_hv_pct'])} | {pct(delta['mean_regime_eu_pct'])} | {row['adapt_score']:.3f} | {pct(delta['trace_shift_regret_pct'])} | {trace['trace_recovery_latency']:.3g} |"
             )
     lines.extend([
         "",
@@ -627,7 +655,7 @@ def write_report(path: Path, results: dict) -> None:
         "- H1 should cost less than a Transformer key. Judge its quality using HV/EU, shift regret, and recovery episodes rather than query time alone.",
         "- Exact and HNSW retrieval use the same bank, queries, and Top-K. Their routing latency excludes shared environment rollout and policy action costs.",
         "",
-        "Raw data are stored in `ablation_metrics.json` and `latency_benchmark.json` in the output directory. Rerun with `scripts/run_owcmorl_ablation_study.py`.",
+        "Relative metric differences and latency data are stored in `ablation_metrics.json` and `latency_benchmark.json` in the output directory; absolute HV/EU/shift-regret values are not persisted. Rerun with `scripts/run_owcmorl_ablation_study.py`.",
     ])
     path.write_text("\n".join(lines) + "\n")
 
@@ -637,7 +665,15 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.set_num_threads(1)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    results = {"config": vars(args), "table1_owcmorl": table1_owcmorl_baseline(), "environments": {}}
+    results = {
+        "config": vars(args),
+        "metric_comparison": {
+            "baseline_variant": "full_hnsw",
+            "relative_difference_formula": "100 * (variant - full_hnsw) / abs(full_hnsw)",
+            "absolute_hv_eu_shift_regret_persisted": False,
+        },
+        "environments": {},
+    }
     results["config"] = {key: str(value) if isinstance(value, Path) else value for key, value in results["config"].items()}
     for env_key in args.env_keys:
         snapshots = load_snapshots(args.snapshot_root, env_key)
@@ -687,6 +723,7 @@ def main() -> None:
             summary["trace"] = compute_trace_shift_metrics(
                 composite_trace(regimes, trace_segments[name]), eval_delta_weight=0.5
             )
+        add_relative_metrics(summaries)
         full_latency = benchmark_latency(
             full_entries,
             representations.full,
@@ -712,7 +749,10 @@ def main() -> None:
             "bank_entry_count": len(full_entries),
             "single_algorithm": single_algorithm,
             "current_token_bank_entry_count": len(current_token_entries),
-            "variants": summaries,
+            "variants": {
+                name: persisted_variant_metrics(summary)
+                for name, summary in summaries.items()
+            },
             "latency": {
                 "full_hnsw": full_latency["hnsw"],
                 "full_exact": full_latency["exact"],
