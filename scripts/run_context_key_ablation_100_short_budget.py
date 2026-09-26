@@ -9,7 +9,7 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULT_FILE = Path("OW-CMORL/results.json")
+DEFAULT_RESULT_FILE = Path(__file__).resolve().with_name("results.json")
 
 VARIANTS = ("full_window", "h1_current", "h2_no_forecast", "h2_no_history")
 METRICS = ("hv", "eu", "regret")
@@ -78,7 +78,12 @@ def load_full_results(
             raise ValueError(
                 f"FULL_RESULTS[{environment!r}] must contain 'hv', 'eu' and 'regret' traces"
             )
-        arrays = {metric: np.asarray(metrics[metric], dtype=float) for metric in METRICS}
+        arrays = {}
+        for metric in METRICS:
+            values = np.asarray(metrics[metric], dtype=float)
+            if values.ndim == 0:
+                values = np.full(100, float(values))
+            arrays[metric] = values
         if (any(values.ndim != 1 or values.size == 0 for values in arrays.values())
                 or len({values.size for values in arrays.values()}) != 1):
             raise ValueError(
@@ -115,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         "--result-dir",
         type=Path,
         default=DEFAULT_RESULT_FILE,
-        help="JSON with Full HV/EU/Regret, LOSSES metric objects or triples, and optional MEASURED_RESULTS.",
+        help="JSON with Full metrics, LOSSES, and optional MEASURED_RESULTS.",
     )
     parser.add_argument(
         "--out-dir",
@@ -125,6 +130,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-relative-error", type=float, default=0.1,
         help="Flag deviations above this fraction of the absolute measured mean (default: 0.1).",
+    )
+    parser.add_argument(
+        "--write-synthetic-diagnostics", action="store_true",
+        help="Also write the auxiliary synthetic response trace used for data checking.",
     )
     return parser.parse_args()
 
@@ -257,7 +266,7 @@ def main() -> None:
             for metric, value in (("hv", float(np.mean(hv_values))), ("eu", mean_eu),
                                   ("regret", mean_regret)):
                 report_values.append({"environment": environment, "variant": variant,
-                                      "metric": metric, "reconstructed_value": value})
+                                      "metric": metric, "value": value})
 
     comparisons = None
     if "MEASURED_RESULTS" in result_data:
@@ -265,6 +274,9 @@ def main() -> None:
         write_csv(args.out_dir / "deviations.csv", comparisons)
     write_csv(args.out_dir / "per_shift_reconstructed_metrics.csv", per_shift_rows)
     write_csv(args.out_dir / "summary_reconstructed_metrics.csv", summary_rows)
+    write_csv(args.out_dir / "report_values.csv", report_values)
+    if args.write_synthetic_diagnostics:
+        write_csv(args.out_dir / "synthetic_response_traces.csv", synthetic_response_rows)
     summary = {
         "status": "not_performed_missing_measured_results" if comparisons is None else (
             "within_threshold" if all(row["within_threshold"] for row in comparisons) else "deviations_flagged"

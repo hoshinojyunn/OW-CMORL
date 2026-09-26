@@ -6,6 +6,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import product
 from pathlib import Path
 from typing import Iterable
@@ -153,6 +154,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latency-replicas", type=int, default=16)
     parser.add_argument("--latency-query-repeats", type=int, default=1500)
     parser.add_argument("--skip-latency", action="store_true")
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=PROJECT_ROOT.parent / "context_key_ablation.log",
+    )
     return parser.parse_args()
 
 
@@ -640,7 +646,76 @@ def add_relative_metrics(variants: dict[str, dict]) -> None:
             "eu_drop_ratio": relative_drop_ratio(
                 row["mean_regime_eu"], baseline["mean_regime_eu"]
             ),
+            "regret_drop_ratio": relative_drop_ratio(
+                row["trace"]["trace_shift_regret"], baseline["trace"]["trace_shift_regret"]
+            ),
         }
+
+
+def add_trace_metrics(
+    variants: dict[str, dict],
+    regimes: list[str],
+    trace_segments: dict[str, dict[str, np.ndarray]],
+) -> None:
+    for name, summary in variants.items():
+        trace = composite_trace(regimes, trace_segments[name])
+        summary["trace"] = compute_trace_shift_metrics(
+            trace,
+            eval_delta_weight=0.5,
+            recovery_window=12,
+            use_regime_id=True,
+        )
+
+
+def append_ablation_log(
+    path: Path,
+    environment: str,
+    summaries: dict[str, dict],
+    evaluation_events: int,
+    seed: int,
+    args: argparse.Namespace,
+    regimes: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    drop_ratios = {}
+    labels = {
+        "h1_current_token_no_encoder": "current_only",
+        "h2_no_forecast": "no_forecast",
+        "h2_no_history": "no_history",
+    }
+    for name, label in labels.items():
+        if name not in summaries:
+            continue
+        row = summaries[name]
+        relative = row["relative_to_full"]
+        drop_ratios[f"{label}_to_full_EU_ratio"] = relative["eu_drop_ratio"]
+        drop_ratios[f"{label}_to_full_HV_ratio"] = relative["hv_drop_ratio"]
+        drop_ratios[f"{label}_to_full_Regret_ratio"] = relative["regret_drop_ratio"]
+    fields = [
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] environment={environment}",
+        f"evaluation_events={evaluation_events}",
+        *(f"{key}={value:+.12g}" for key, value in drop_ratios.items()),
+        "development_only=true",
+        f"seed={int(seed)}",
+        f"context_window={int(args.context_window)}",
+        f"context_fit_steps={int(args.context_fit_steps)}",
+        f"forecast_lambda={float(args.forecast_lambda):g}",
+        f"history_lambda={float(args.history_lambda):g}",
+        f"retrieval_k={int(args.retrieval_k)}",
+        f"full_retrieval_mode={args.full_retrieval_mode}",
+        f"ablation_retrieval_mode={args.ablation_retrieval_mode}",
+        f"hnsw_ef_search={int(args.hnsw_ef_search)}",
+        f"hnsw_m={int(args.hnsw_m)}",
+        f"context_affinity_weight={float(args.context_affinity_weight):g}",
+        f"single_algorithm={args.single_algorithm}",
+        f"regimes={len(regimes)}",
+        "representations=full|no_history|no_forecast|current_only",
+        "same_routing_params_all_views=true",
+        "regret_metric=trace_shift_regret",
+        "regret_direction=lower_is_better",
+    ]
+    with path.open("a") as handle:
+        handle.write(", ".join(fields) + "\n")
 
 
 def composite_trace(regimes: list[str], segments: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -870,13 +945,16 @@ def main() -> None:
             trace_segments[name] = segments
             selections[name] = ids
         summaries = score_variants(front_rows)
+        add_trace_metrics(summaries, regimes, trace_segments)
         add_relative_metrics(summaries)
+        evaluation_trace = composite_trace(regimes, trace_segments["full_hnsw"])
         results["environments"][env_key] = {
             "variants": {
                 name: (
                     {
                         "hv": summary["mean_regime_hv"],
                         "eu": summary["mean_regime_eu"],
+                        "regret": summary["trace"]["trace_shift_regret"],
                     }
                     if name == "full_hnsw"
                     else summary["relative_to_full"]
@@ -884,6 +962,15 @@ def main() -> None:
                 for name, summary in summaries.items()
             },
         }
+        append_ablation_log(
+            args.log_file,
+            env_key,
+            summaries,
+            len(evaluation_trace["obj"]),
+            args.seed,
+            args,
+            regimes,
+        )
         print(json.dumps({env_key: results["environments"][env_key]}, indent=2))
     (args.out_dir / "context_representation_hv_eu.json").write_text(json.dumps(results, indent=2))
 
