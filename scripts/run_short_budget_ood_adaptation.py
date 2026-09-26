@@ -1,12 +1,3 @@
-#!/usr/bin/env python
-"""Causal phase runner for short-budget OOD adaptation experiments.
-
-The command-line experiment wiring is added only after method adapters have
-passed the checkpoint-continuation capability audit.  The reusable function in
-this module is intentionally dependency-injected so its causal ordering and
-zero-shot guard can be tested without a simulator.
-"""
-
 from __future__ import annotations
 
 import argparse
