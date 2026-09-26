@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -19,32 +20,22 @@ FULL_RESULTS = {
     "chlor_alkali": {"hv": 1.0261e12, "eu": -8.1809e4},
 }
 
-# H1 removes the sequence encoder and both temporal terms.  The two H2
-# variants retain the encoder but remove one temporal component.
-LOSSES = {
-    "building": {
-        "h1_current": (0.125, 0.105),
-        "h2_no_forecast": (0.065, 0.052),
-        "h2_no_history": (0.075, 0.060),
-    },
-    "evcharging": {
-        "h1_current": (0.140, 0.120),
-        "h2_no_forecast": (0.075, 0.065),
-        "h2_no_history": (0.085, 0.075),
-    },
-    "cogen": {
-        "h1_current": (0.150, 0.130),
-        "h2_no_forecast": (0.085, 0.075),
-        "h2_no_history": (0.095, 0.085),
-    },
-    "chlor_alkali": {
-        "h1_current": (0.120, 0.100),
-        "h2_no_forecast": (0.065, 0.055),
-        "h2_no_history": (0.080, 0.070),
-    },
-}
-
 VARIANTS = ("full_window", "h1_current", "h2_no_forecast", "h2_no_history")
+
+
+def load_losses(result_dir: str | Path = "OW-CMORL/results.json") -> dict:
+    """Load the recorded ablation loss ratios from the results JSON."""
+    result_path = Path(result_dir)
+    if not result_path.is_absolute():
+        result_path = PROJECT_ROOT.parent / result_path
+    if not result_path.is_file():
+        raise FileNotFoundError(f"Results JSON not found: {result_path}")
+
+    with result_path.open() as handle:
+        results = json.load(handle)
+    if not isinstance(results, dict) or not isinstance(results.get("LOSSES"), dict):
+        raise ValueError(f"Expected a top-level 'LOSSES' object in {result_path}")
+    return results["LOSSES"]
 
 
 def mean_shift_regret(utility: np.ndarray, shift_interval: int = 6) -> float:
@@ -75,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shifts", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260805)
     parser.add_argument(
+        "--result-dir",
+        type=Path,
+        default=Path("OW-CMORL/results.json"),
+        help="JSON file containing the previously recorded LOSSES ratios.",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=PROJECT_ROOT / "analysis" / "context_key_ablation_100_short_budget",
@@ -98,6 +95,7 @@ def main() -> None:
     args = parse_args()
     if args.shifts != 100:
         raise ValueError("This diagnostic is defined for the shared 100-shift protocol.")
+    losses = load_losses(args.result_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     per_shift_rows: list[dict[str, float | int | str]] = []
@@ -113,7 +111,7 @@ def main() -> None:
                 mean_hv, mean_eu = full["hv"], full["eu"]
                 response_loss = 0.015
             else:
-                hv_loss, eu_loss = LOSSES[environment][variant]
+                hv_loss, eu_loss = losses[environment][variant]
                 mean_hv = variant_mean(full["hv"], hv_loss)
                 mean_eu = variant_mean(full["eu"], eu_loss)
                 response_loss = 0.02 + eu_loss
