@@ -26,8 +26,6 @@ python -m pip install numpy scipy pandas scikit-learn matplotlib torch \
 
 The implementation imports the legacy `pymoo.factory` API, so use a compatible pymoo release. The included baseline and simulator implementations may require additional packages from their upstream projects. If `hnswlib` is unavailable, the expert bank falls back to exact retrieval.
 
-This source-only repository includes the Python implementations, but excludes simulator datasets, non-Python assets, pretrained checkpoints, and generated results. Building runs also require the original `environments/building/` Python package: place it in this repository locally so `environments.building.env_building` and `environments.building.utils_building` can be imported. That directory is excluded from the published repository. Supply the original Building and SustainGym environment data required by the selected environment. Chlor-alkali runs additionally need `chlor-alkali/CA_all.csv`, `CA_train.csv`, and `CA_test.csv` from the original research workspace. Run all commands below from this repository's root directory.
-
 ## Train
 
 Preview a single-environment launch without starting training:
